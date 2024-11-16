@@ -21,6 +21,7 @@ import subprocess
 from utilities import * 
 from Bio.Seq import reverse_complement
 import sys
+from Bio import Align
 
 if not sys.warnoptions:
     import warnings
@@ -41,7 +42,7 @@ def args_parser():
     # pre-processing
     pre = sub_parsers.add_parser("pre", help = "preprocess fastq sequencing read", parents = [parser], add_help = False)
     pre.add_argument("-fastq", "--fastq", nargs = 2, required = True, help="fastq input file (for paired-end reads, order in R1 R2)")
-    pre.add_argument("-read_len", "--read_length", type = int, default = 35, help = "read length used for alignment")
+    pre.add_argument("-read_len", "--read_length", required = False, help = "read length used for alignment")
     pre.add_argument("-primer", "--primer_seq", required = False, help = "primer sequence to be used for read filtering")
     pre.add_argument("-barcode", "--barcode", required = False, help = "barcode table used for filtering on read2 (no header)")
     # alignment 
@@ -209,12 +210,14 @@ def frame_count(frame_df):
     frame_out = pd.DataFrame(c_list, columns = ["gene", "symbol", "count", "chrom", "pos"])
     return frame_out
 
-def read_donor_filter(read_featured, donor):
-    from Bio import Align
+def retrieve_clip_seq(read_featured, output):
     read_featured["clip_size"] = np.where((read_featured["strand"] == "+") & (read_featured["cigar_char"].str[0] == "S"), read_featured["cigar_len"].str[0].astype(int), np.where((read_featured["strand"] == "-") & (read_featured["cigar_char"].str[-1] == "S"), read_featured["cigar_len"].str[-1].astype(int), 0))
     # for read not reported as soft-clipping, I retrieve partial for alignment
-    read_featured["clip_size"] = np.where(read_featured["clip_size"] < len(donor)*0.8, 16, read_featured["clip_size"])
-    # 
+    read_featured["clip_size"] = np.where(read_featured["clip_size"] < 10, 10, read_featured["clip_size"])
+    #read_featured.to_csv(os.path.join(output, output + ".read"), sep = "\t", header = True, index = False)
+    return read_featured
+
+def read_donor_filter(read_featured, donor, output):
     clip_seq_list = list()
     for row in read_featured.itertuples():
         if row.strand == "+":
@@ -223,9 +226,8 @@ def read_donor_filter(read_featured, donor):
             clip_seq = reverse_complement(row.seq[-row.clip_size:])
         clip_seq_list.append(clip_seq)
     read_featured["clip_seq"] = clip_seq_list
-    # 
     clip_df = read_featured[["clip_seq"]].drop_duplicates(keep = "first", ignore_index = True)
-    # 
+    # initiate aligner for pairwise seq alignment
     aligner = Align.PairwiseAligner()
     aligner.mode = "global"
     aligner.match_score = 1
@@ -237,16 +239,23 @@ def read_donor_filter(read_featured, donor):
     aligner.query_left_gap_score = -6
     aligner.query_right_gap_score = 0
     # 
-    align_score = list()
-    for row in clip_df.itertuples():
-        for alignment in aligner.align(donor, row.clip_seq): # (target ,query)
-            align_score.append(alignment.score)
-            break
-    clip_df["donor_score"] = align_score
-    read_featured_scored = pd.merge(read_featured, clip_df, on = "clip_seq", how = "left")
+    align_score = dict()
+    clip_seq = clip_df["clip_seq"].tolist()
+    fw = open(os.path.join(output, output + ".align"), "w")
+    for seq in clip_seq:
+        # print(seq, type(seq))
+        alignments = aligner.align(donor.upper(), seq.upper())
+        alignment = alignments[0] # (target ,query)
+        #print(alignment, alignment.score)
+        fw.write(str(alignment))
+        fw.write(f"Score: {alignment.score}\n")
+        align_score[seq] = alignment.score
+    # 
+    score_df = pd.DataFrame.from_dict(align_score, orient = "index", columns = ["donor_score"])
+    print(score_df)
+    read_featured_scored = pd.merge(read_featured, score_df, right_index = True, left_on = "clip_seq", how = "left")
     read_featured_scored = read_featured_scored[read_featured_scored["donor_score"] > 5].copy()
     return read_featured_scored
-
 
 def main():
     args = args_parser()
@@ -297,13 +306,15 @@ def main():
         r2_select_df = r2_df[r2_df["name"].isin(select_read)]
         # write r1/r2 
         if args.read_length != None:
-            r1_tail = r1_head + args.read_length
-            r2_tail = r2_head + args.read_length
+            r1_tail = r1_head + int(args.read_length)
+            r2_tail = r2_head + int(args.read_length)
+            logging.info(f"sub read length\t{args.read_length}")
         else:
             r1_tail = None 
             r2_tail = None 
+            r1_len = fq2len(r1)
+            logging.info(f"sub read length\t{r1_len - r1_head}")
         print("Write new fastq ....")
-        logging.info(f"sub read length\t{args.read_length}")
         write_read(r1_select_df, os.path.join(output, output + "_R1.fq"), start=r1_head, end=r1_tail)
         write_read(r2_select_df, os.path.join(output, output + "_R2.fq"), start=r2_head, end=r2_tail)
         align_r1 = os.path.join(output, output + "_R1.fq")
@@ -372,8 +383,12 @@ def main():
         logging.info(f"Genes w/ read\t{genes_featured_num}")
         # filter bed by donor sequence
         if args.donor != None:
-            logging.info(f"Donor seq to check\t{args.donor}")
-            read_donored = read_donor_filter(read_featured, args.donor)
+            print("Examine linker seq ....")
+            logging.info(f"Donor seq to check\t{args.donor.upper()}")
+            read_featured = retrieve_clip_seq(read_featured, output)
+            # print(read_featured_clip.head())
+            read_donored = read_donor_filter(read_featured, args.donor, output)
+            # print(read_donored.head())
             read_donored_num = len(set(read_donored["name"]))
             logging.info(f"donor filter\t{read_donored_num}({round(read_donored_num/bed_num*100, 2)}%)")
             genes_donored_num = len(set(read_donored["gene_"]))
@@ -391,15 +406,15 @@ def main():
         logging.info(f"Frame1 gene#\t{frame1_gene_num}")
         logging.info(f"Frame2 gene#\t{frame2_gene_num}")
         if args.frame == 0:
-            bamfilter(args.bam, list(set(frame0_df["name"])), output)
+            #bamfilter(args.bam, list(set(frame0_df["name"])), output)
             target_df = frame_count(frame0_df)
             target_df.to_csv(os.path.join(output, output + "_inframe.txt"), sep = "\t", header = True, index = False)
         elif args.frame == 1:
-            bamfilter(args.bam, list(set(frame1_df["name"])), output)
+            #bamfilter(args.bam, list(set(frame1_df["name"])), output)
             target_df = frame_count(frame1_df)
             target_df.to_csv(os.path.join(output, output + "_inframe.txt"), sep = "\t", header = True, index = False)
         elif args.frame == 2:
-            bamfilter(args.bam, list(set(frame2_df["name"])), output)
+            #bamfilter(args.bam, list(set(frame2_df["name"])), output)
             target_df = frame_count(frame2_df)
             target_df.to_csv(os.path.join(output, output + "_inframe.txt"), sep = "\t", header = True, index = False)
         else:
