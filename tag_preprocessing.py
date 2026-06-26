@@ -11,26 +11,27 @@ primer carried by R1;
 barcode carries by R2;
 both primer/barcode are optional; 
 
+This program support multiple-parallel processing via MPI. mpi4py is required to run it. 
+
 Example:
 mpiexec -n 12 tag_preprocessing.py -sample <GC> -dir <dir> -outdir <output> -primer [seq] -barcode [barcode]
 
 For GFP, primer required; 
 For ChiC, no primer given. 
-
 """
 
 def args_parser():
     '''parser the argument from terminal command'''
     parser = argparse.ArgumentParser(prog = "PROG", add_help = True, formatter_class = argparse.RawDescriptionHelpFormatter)
     # important parameters 
-    parser.add_argument("-sample", "--sample", help="sample prefix used to find fastq file")
+    parser.add_argument("-sample", "--sample", help="sample prefix for fastq file")
     parser.add_argument("-outdir", "--outdir", default = ".", help="output directory name")
     parser.add_argument("-dir", "--directory", help = "read directory used to find its fastq file")
     parser.add_argument("-read_len", "--read_length", default = 100, type = int, help = "read length used for alignment")
-    parser.add_argument("-primer", "--primer_seq", required = False, help = "primer sequence to be used for read filtering")
+    parser.add_argument("-primer", "--primer_seq", required = False, help = "a string for primer sequence to be used for read filtering")
     # parser.add_argument("-regex", action = "store_true", help = "primer sequence provided in regular expression pattern.")
-    parser.add_argument("-barcode", "--barcode", required = False, help = "cell barcode table used to filter and group on read")
-    parser.add_argument("-p", "--prefix", action = "store_true", help = "if sample as prefix name (to add [0-9][0-9] for searching its R1/R2)")
+    parser.add_argument("-barcode", "--barcode", required = False, help = "a file with cell barcodes used to filter and group on read (per barcode each row)")
+    parser.add_argument("-p", "--prefix", action = "store_true", help = "enable searching for fastq files by sample prefix and [0-9][0-9]")
     args=parser.parse_args()
     return args
 
@@ -41,6 +42,7 @@ def main():
     # to overcome the overflow error when comm data > 2 GB
     rank = comm.Get_rank()
     size = comm.Get_size()
+    # parse arguments 
     args = args_parser()
     # requied argument
     output_dir = args.outdir
@@ -53,14 +55,18 @@ def main():
     sample = args.sample
     log_file = os.path.join(output_dir, sample +".log")
     rdir = args.directory
+    # when prefix not enabled, directly searching for fastq files in sample name 
     if not args.prefix:
         r1_list = sorted(glob.glob(os.path.join(rdir, sample + "_R1.fastq.gz")))
         r2_list = sorted(glob.glob(os.path.join(rdir, sample + "_R2.fastq.gz")))
+    # when prefix enabled, searching for fastq files by sample name + [0-9][0-9] pattern 
     else:
         r1_list = sorted(glob.glob(os.path.join(rdir, sample + "[0-9][0-9]_R1.fastq.gz")))
         r2_list = sorted(glob.glob(os.path.join(rdir, sample + "[0-9][0-9]_R2.fastq.gz")))
+    # make sure each sample have paired reads (in R1/R2)
     if [r.split("_R1")[0] for r in r1_list] != [r.split("_R2")[0] for r in r2_list]:
         raise IOError("Cannot correctly locate paired R1/R2!")
+    # load custom functions 
     from utilities.fastq_tools import fq2df, read_len, read_select, write_read
     primer_seq = args.primer_seq.upper()
     if len(r1_list) == 0:
